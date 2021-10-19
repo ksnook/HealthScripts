@@ -122,9 +122,9 @@ Function New-ServerHealthHTMLTableCell()
         $success {$htmltablecell = "<td class=""pass"">$($reportline."$lineitem")</td>"}
         "Success" {$htmltablecell = "<td class=""pass"">$($reportline."$lineitem")</td>"}
         "Pass" {$htmltablecell = "<td class=""pass"">$($reportline."$lineitem")</td>"}
-        "Warn" {$htmltablecell = "<td class=""warn"">$($reportline."$lineitem")</td>"}
+        "Warn" {$htmltablecell = "<td class=""warn""><p class=""blink"">$($reportline."$lineitem")</p></td>"}
         "Access Denied" {$htmltablecell = "<td class=""warn"">$($reportline."$lineitem")</td>"}
-        "Fail" {$htmltablecell = "<td class=""fail"">$($reportline."$lineitem")</td>"}
+        "Fail" {$htmltablecell = "<td class=""fail""><p class=""blink"">$($reportline."$lineitem")</p></td>"}
         "Could not test service health. " {$htmltablecell = "<td class=""warn"">$($reportline."$lineitem")</td>"}
         "Unknown" {$htmltablecell = "<td class=""warn"">$($reportline."$lineitem")</td>"}
         default {$htmltablecell = "<td>$($reportline."$lineitem")</td>"}
@@ -218,6 +218,8 @@ $fail = "Red"
 $ip = $null
 [array]$serversummary = @()                                 #Summary of issues found during server health checks
 [array]$report = @()
+[array]$failreport = @()
+[array]$passreport = @()
 [bool]$alerts = $false
 $servicestatus = "Pass"
 $diskstatus = "Pass"
@@ -908,25 +910,7 @@ if ($ReportMode -or $SendEmail)
     $reportime = (Get-Date).ToString("dd/MM/yyyy HH:mm")
 
     #Create HTML Report
-    #Common HTML head and styles
-    $htmlhead="<html>
-                <style>
-                BODY{font-family: Tahoma; font-size: 8pt;}
-                H1{font-size: 16px;}
-                H2{font-size: 14px;}
-                H3{font-size: 12px;}
-                TABLE{Margin: 0px 0px 0px 4px;Border: 1px solid rgb(190, 190, 190);Font-Family: Tahoma;Font-Size: 8pt;Background-Color: rgb(252, 252, 252);}
-                tr:hover td{Background-Color: rgb(0, 127, 195);Color: rgb(255, 255, 255);}
-                tr:nth-child(even){Background-Color: rgb(110, 122, 130);}th{Text-Align: Left;Color: rgb(150, 150, 220);Padding: 1px 4px 1px 4px;}
-                td{Vertical-Align: Top;Padding: 1px 4px 1px 4px;}
-                td.pass{background: #7FFF00;}
-                td.warn{background: #FFE600;}
-                td.fail{background: #FF0000; color: #ffffff;}
-                td.info{background: #85D4FF;}
-                </style>
-                <body>
-                <h1 align=""center"">PURE Health Check Report</h1>
-                <h3 align=""center"">Generated: $reportime</h3>"
+    
     if ($SystemErrors){            
                 $htmlhead += "<a href=""$ReportURL"">Error Report File</a>"
                 }
@@ -958,7 +942,36 @@ if ($ReportMode -or $SendEmail)
                         <p>No PURE health errors or warnings.</p>"
     }
     
-        
+    #Common HTML head and styles
+    $htmlhead="<html>
+                <head><title>PURE GreenScreen - $servicestatus</title></head>
+                <style>
+                BODY{font-family: Tahoma; font-size: 8pt;}
+                H1{font-size: 16px;}
+                H2{font-size: 14px;}
+                H3{font-size: 12px;}
+                TABLE{Margin: 0px 0px 0px 4px;Border: 1px solid rgb(190, 190, 190);Font-Family: Tahoma;Font-Size: 8pt;Background-Color: rgb(252, 252, 252);}
+                tr:hover td{Background-Color: rgb(0, 127, 195);Color: rgb(255, 255, 255);}
+                tr:nth-child(even){Background-Color: rgb(110, 122, 130);}th{Text-Align: Left;Color: rgb(150, 150, 220);Padding: 1px 4px 1px 4px;}
+                td{Vertical-Align: Top;Padding: 1px 4px 1px 4px;}
+                td.pass{background: #7FFF00;}
+                td.warn{background: #FFE600;}
+                td.fail{background: #FF0000; color: #ffffff;}
+                td.info{background: #85D4FF;}
+                </style>
+                <style>
+      		    .blink {
+      		    animation: blinker 0.8s linear infinite;
+                font-weight: bold;
+                }
+                @keyframes blinker {  
+                50% { opacity: 0; }
+                }
+                </style>
+                <body>
+                <h1 align=""center"">PURE Health Check Report</h1>
+                <h3 align=""center"">Generated: $reportime</h3>"
+                   
     #PURE Health Report Table Header
     $htmltableheader = "<h3>PURE Health Summary</h3>
                         <p>
@@ -979,9 +992,66 @@ if ($ReportMode -or $SendEmail)
     #PURE Health Report Table
     
     $serverhealthhtmltable = $null
-    $serverhealthhtmltable = $serverhealthhtmltable + $htmltableheader                    
+    $serverhealthhtmltable = $serverhealthhtmltable + $htmltableheader  
+    
+    foreach ($line in $report){
+        #Pop reportlines into separate arrays based on whether they have errors or not
+        #write-host "report line is"
+        #write-host $line
+        if ($line -match "Fail" -or $line -match "Warn"){
+            write-host "$($line.array) has failures/warnings" -ForegroundColor Red
+            $failreport += $line
+            }
+        else{
+            write-host "$($line.array) is OK" -ForegroundColor Green
+            $passreport += $line
+            }
+        }                  
                         
-    foreach ($reportline in $report)
+    #Add failures to top of table so they show up first
+    foreach ($reportline in $failreport)
+    {
+        $htmltablerow = "<tr>"
+        $htmltablerow += "<td>$($reportline.array)</td>"
+        #$htmltablerow += "<td>$($reportline.cluster)</td>"
+        $htmltablerow += (New-ServerHealthHTMLTableCell "DNS")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Ping")
+        
+        #if ($($reportline."uptime (hrs)") -eq "Access Denied")
+        #{
+        #    $htmltablerow += "<td class=""warn"">Access Denied</td>"        
+        #}
+        #elseif ($($reportline."uptime (hrs)") -eq "Unable to retrieve uptime. ")
+        #{
+        #    $htmltablerow += "<td class=""warn"">Unable to retrieve uptime. </td>"
+        #}
+        #else
+        #{
+        #    $hours = [int]$($reportline."uptime (hrs)")
+        #    if ($hours -le 24)
+        #    {
+        #        $htmltablerow += "<td class=""warn"">$hours</td>"
+        #    }
+        #    else
+        #    {
+        #        $htmltablerow += "<td class=""pass"">$hours</td>"
+        #    }
+        #}
+
+        $htmltablerow += (New-ServerHealthHTMLTableCell "System")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Protection Groups")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Snapshots")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Alerts")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Networks")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Hardware")
+        $htmltablerow += (New-ServerHealthHTMLTableCell "Volumes")
+        $htmltablerow += "</tr>"
+        
+        $serverhealthhtmltable = $serverhealthhtmltable + $htmltablerow
+    }
+
+     #Add passes to bottom of table so they show up last
+    foreach ($reportline in $passreport)
     {
         $htmltablerow = "<tr>"
         $htmltablerow += "<td>$($reportline.array)</td>"

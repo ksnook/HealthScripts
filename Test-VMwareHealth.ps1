@@ -62,8 +62,8 @@ param (
         [Parameter( Mandatory=$false)]
         [string]$ServerList,    
         
-        [Parameter( Mandatory=$false)]
-        [string]$ReportFile="C:\inetpub\wwwroot\monitor\vmwarehealth.html",
+        #Parameter( Mandatory=$false)]
+        #[string]$ReportFile="C:\inetpub\wwwroot\monitor\vmwarehealth.html",
 
         [Parameter( Mandatory=$false)]
         [switch]$ReportMode=$true,
@@ -175,20 +175,53 @@ Function Write-Logfile()
 Function Check_VMHost_Running_Services
 {
 param (
-    $VMHostList
+    $VMHost
 )
-$NORMALSERVICES = @("DCUI","TSM","TSM-SSH","lbtd","ntpd","sfcbd-watchdog","vmsyslogd","vmware-fdm","vpxa")
+
+$RUNNINGSERVICES = $VMHost| Get-VMHostService | where {($_.Running -eq $True)} 
+
+if ($Log) {Write-Logfile "Version on $($VMHost) is $($VMHost.Version)"}
+if ($Log) {Write-Logfile "Running services on $($VMHost) are $($RUNNINGSERVICES)"}
+$NORMALSERVICES = @("DCUI","lbtd","vmsyslogd","vpxa")
+$VMHostCluster = Get-cluster -VMHost $VMHost
+#If this is in a cluster with HA enabled then the FDM service should be running as well
+if($VMHostCluster.HAEnabled){
+    $NORMALSERVICES += "vmware-fdm"
+    }
+#If this is a host with NTP enabled then the NTPD service should be running as well    
+$NTPStatus = $VMHost | Get-VMHostNtpServer
+if ($Log) {Write-Logfile "NTP server is $($NTPStatus)"}
+if ($NTPStatus) {
+    #Added extra piece for ntpd as it often reports running but actually is not
+    #$NORMALSERVICES += "ntpd"
+    #$cmd = 'ntpq -p'
+    $cmd = '/etc/init.d/ntpd status'
+    #write-host $cmd
+    $plink = "echo y | C:\PROGRA~1\PUTTY\plink.exe"
+    $remoteCommand = '"' + $cmd + '"'
+    $commandoutput = $null
+    $commandoutput = run-ssh-command $VMHost $ESXiMonitorCredential.UserName $ESXiMonitorCredential.Password $remoteCommand $false
+    #write-host "Command out is $($commandoutput)"
+    if ($commandoutput -contains "ntpd is not running"){
+        if ($Log) {Write-Logfile "NTP service not running"}
+        $ERRORSERVICES += "ntpd "
+        }
+    else{
+        if ($Log) {Write-Logfile "NTP service running"}
+        }
+    }
+if ($Log) {Write-Logfile "Checking the following services are running: $($NORMALSERVICES)"}
 foreach ($NORMALSERVICE in $NORMALSERVICES){
     #write-host "Is service $($NORMALSERVICE) running"
     if ($Log) {Write-Logfile "Is service $($NORMALSERVICE) running"}
-    if ($RUNNINGSERVICES -match $SERVICE){
+    if ($RUNNINGSERVICES -match $NORMALSERVICE){
         #write-host "$($NORMALSERVICE) in $($RUNNINGSERVICES)"
         if ($Log) {Write-Logfile "$($NORMALSERVICE) in $($RUNNINGSERVICES)"}
         }
     else{
         #write-host "$($NORMALSERVICE) not in $($RUNNINGSERVICES)"
         if ($Log) {Write-Logfile "$($NORMALSERVICE) not in $($RUNNINGSERVICES)"}
-        $ERRORSERVICE += $NORMALSERVICE
+        $ERRORSERVICES += "$NORMALSERVICE "
         }
     }
  
@@ -213,6 +246,7 @@ function Get-vCSA-Services {
       } else{
            $respond = Invoke-RestMethod -Method $method  -Headers $headers -uri $RestApiUrl/appliance/techpreview/services
            $listvCSAServices = $respond.value | Select-Object -Property @{N='Service Name';E={$_.name}},@{N='Description';E={$_.description}}
+
       }
   
        return $listvCSAServices
@@ -409,7 +443,7 @@ foreach ($ESXiHost in $ESXiHostList){
         #$output = $plink + " " + "-ssh" + " " + $root + "@" + $ESXiHost + " " + "-pw" + " " + $decrypted + " " + $remoteCommand
         $output = $plink + " " + "-ssh" + " " + $UserName + "@" + $ESXiHost + " " + "-pw" + " " + $decrypted + " " + $remoteCommand
         #write-host $output
-        if ($Log) {Write-Logfile $output}
+        #if ($Log) {Write-Logfile $output}
         try {$message = Invoke-Expression -command $output}
         catch {Write-Host -ForegroundColor $warn "Exception message is $($_.Exception.Message)"
             $message = "Error Logging On $($_.Exception.Message)"
@@ -659,8 +693,8 @@ function Get-vMon-Services{
        $method = "GET"            
  
        $respond = Invoke-RestMethod -Method $method  -Headers $headers -uri $RestApiUrl/appliance/vmon/service
-       $listVmonServices = $respond.value | Select-Object -Property @{N='Service Name';E={$_.key}},@{N='State';E={$_.value.state}},@{N='Health';E={$_.value.health}},@{N='Startup Type';E={$_.value.startup_type}} | Sort-Object -Property 'State'
-        
+       $listVmonServices = $respond.value | Select-Object -Property @{N='ServiceName';E={$_.key}},@{N='State';E={$_.value.state}},@{N='Health';E={$_.value.health}},@{N='Startup Type';E={$_.value.startup_type}} | Sort-Object -Property 'State'
+       if ($Log) {Write-Logfile "VMON Services Found: $($listVmonServices)"}
        return $listVmonServices
 }
 
@@ -725,6 +759,142 @@ function Start-vCSA-Service {
        return $listvCSAService
 }
 
+#Function to report vCenter replication status
+function Get-vCSA-Replication-Status{
+    param (
+       [Parameter(Mandatory=$true)][string]$AuthTokenValue
+    )
+    #curl -X GET --header 'Accept: application/json' --header 'vmware-api-session-id: 82427d1baafec43f7d1b71ef02ab17b8' 'https://vcsa67.ipats.local/rest/appliance/system/storage'
+       
+       $headers = @{
+            'Accept' = 'application/json';
+            'vmware-api-session-id'= $AuthTokenValue;
+       }
+       $method = "GET"       
+       write-host "Running replication status - vcsaversion $($vcsaVersion)"
+       #v7.02 onwards = https://{api_host}/api/vcenter/topology/replication-status
+       #v6.7 = https://{api_host}/rest/vcenter/topology/replication-status
+       if (([regex]::match($vcsaVersion ,"6.7")).success){
+          if ($vcsaVersion -eq "6.7.0"){
+            if ($Log) {Write-Logfile "Version $($vcsaVersion) Replication Status not supported"}
+            }
+          else{
+            if ($Log) {Write-Logfile "Version $($vcsaVersion) URL https://$($vCenterFQDN)/rest/topology/replication-status"}
+            $respond = Invoke-RestMethod -Method $method -Headers $headers -uri https://$vCenterFQDN/rest/topology/replication-status
+            $vCenterReplicationStatus = $respond | where {$_.node -eq $vCenterFQDN} | Select-Object node,change_lag,status_available,partner_available,replicating,replication_partner  | Sort-Object -Property node
+            }
+          }
+       else{
+          if ($Log) {Write-Logfile "Version $($vcsaVersion) URL https://$($vCenterFQDN)/api/vcenter/topology/replication-status"}
+          $respond = Invoke-RestMethod -Method $method -Headers $headers -uri https://$vCenterFQDN/api/vcenter/topology/replication-status
+          $vCenterReplicationStatus = $respond | where {$_.node -eq $vCenterFQDN} | Select-Object node,change_lag,status_available,partner_available,replicating,replication_partner  | Sort-Object -Property node
+        }
+       
+       return $vCenterReplicationStatus
+}
+
+#Function to report vCenter HA status
+#function Get-vCSA-HA-Status{
+#    param (
+#       [Parameter(Mandatory=$true)][string]$AuthTokenValue
+#    )
+#       
+#       $headers = @{
+#            'Accept' = 'application/json';
+#            'vmware-api-session-id'= $AuthTokenValue;
+#       }
+#       $method = "POST"       
+#        write-host "Running VCHA status - vcsaversion $($vcsaVersion)"
+#        if (([regex]::match($vcsaVersion ,"6.7")).success){
+#            #It's 6.7 so use old version of REST API https://{api_host}/rest/vcenter/vcha/cluster?action=get
+#            if ($Log) {Write-Logfile "Version $($vcsaVersion) URL https://$($vCenterFQDN)/rest/vcenter/vcha/cluster?action=get"}
+#            $respond = Invoke-RestMethod -Method $method -Headers $headers -uri https://$vCenterFQDN/rest/vcenter/vcha/cluster?action=get
+#            #$respond.value
+#            #@{mode=ENABLED; health_state=HEALTHY; witness=; node2=; manual_failover_allowed=True; auto_failover_allowed=True; config_state=CONFIGURED; node1=}
+#            $vCenterHAStatus = $respond.value |Select-Object mode,health_state,witness,manual_failover_allowed,auto_failover_allowed,config_state  
+#            
+#            }
+#       
+#        #https://{api_host}/api/vcenter/vcha/cluster?action=get
+#        else{
+#            if ($Log) {Write-Logfile "Version $($vcsaVersion) URL https://$($vCenterFQDN)/api/vcenter/vcha/cluster?action=get"}
+#            $respond = Invoke-RestMethod -Method $method -Headers $headers -uri https://$vCenterFQDN/api/vcenter/vcha/cluster?action=get
+#            #write-host $respond
+#            $vCenterHAStatus = $respond |Select-Object mode,health_state,witness,manual_failover_allowed,auto_failover_allowed,config_state  
+#            }
+#       return $vCenterHAStatus
+#}
+
+Function Get-VCHAConfig {
+param (
+       [Parameter(Mandatory=$true)]$VCenter
+    )
+
+    write-host "Fetching VCHA Status for $($VCenter)"
+    $vCenterHAStatus = "Healthy"
+    if ($Log) {Write-Logfile "Fetching VCHA Status for $($VCenter)"}
+    $vcHAClusterConfig = Get-View failoverClusterConfigurator -Server $VCenter
+    foreach ($vcHACluster in $vcHAClusterConfig){
+        $vcHAConfig = $vcHACluster.getVchaConfig()
+        $vcHAState = $vcHAConfig.State
+        write-host "State is $($vcHAState)"
+        switch($vcHAState) {
+        configured {
+            $activeIp = $vcHAConfig.FailoverNodeInfo1.ClusterIpSettings.Ip.IpAddress
+            $passiveIp = $vcHAConfig.FailoverNodeInfo2.ClusterIpSettings.Ip.IpAddress
+            $witnessIp = $vcHAConfig.WitnessNodeInfo.IpSettings.Ip.IpAddress
+
+            $vcHAClusterManager = Get-View failoverClusterManager -Server $VCenter
+            $vcHAMode = $vcHAClusterManager.getClusterMode()
+            $healthInfo = $vcHAClusterManager.GetVchaClusterHealth()
+            $vcClusterState = $healthInfo.RuntimeInfo.ClusterState
+            $nodeState = $healthInfo.RuntimeInfo.NodeInfo
+            
+            Write-Host -ForegroundColor Green "VCHA Cluster State: "
+            Write-Host -ForegroundColor White "$vcClusterState"
+            if ($vcClusterState -notlike "healthy"){
+                $vCenterHAStatus = "Unhealthy"
+                }
+            if ($Log) {Write-Logfile "VCHA Cluster State: $($vcClusterState)"}
+            Write-Host -ForegroundColor Green "VCHA Node Information: "
+            if ($Log) {Write-Logfile "VCHA Node Information:"}
+            $nodeinfo = $nodeState | Select NodeIp, NodeRole, NodeState
+            foreach ($node in $nodeinfo){
+                if ($node.NodeState -notlike "up"){
+                    if ($Log) {Write-Logfile "$($node.NodeIp) ($($node.NodeRole)) is not up"}
+                    Write-Host -ForegroundColor Red "$($node.NodeIp) ($($node.NodeRole)) is not up"
+                    $vCenterHAStatus = "Unhealthy"
+                    }
+                else{
+                    if ($Log) {Write-Logfile "$($node.NodeIp) ($($node.NodeRole)) is up"}
+                    Write-Host -ForegroundColor White "$($node.NodeIp) ($($node.NodeRole)) is up"
+                    }
+                }       
+            Write-Host -ForegroundColor Green "VCHA Mode: "
+            Write-Host -ForegroundColor White "$vcHAMode"
+            if ($vcHAMode -notlike "enabled"){
+                $vCenterHAStatus = "Disabled"
+                }
+            ;break
+            }
+        invalid { Write-Host -ForegroundColor Red "VCHA State is in invalid state ..."
+            if ($Log) {Write-Logfile "VCHA config is invalid"}
+            Write-Host -ForegroundColor White "VCHA config is invalid"
+            $vCenterHAStatus = "Invalid"       
+            ;break
+            }
+        notConfigured { Write-Host "VCHA is not configured"
+             if ($Log) {Write-Logfile "VCHA is not configured"}
+            Write-Host -ForegroundColor White "VCHA is not configured"
+            $vCenterHAStatus = "Healthy"
+            ;break}
+        prepared { Write-Host "VCHA is being prepared, please try again in a little bit ...";break}
+        }
+    }
+
+return $vCenterHAStatus
+}
+
 
 
 #Function to terminate the session 
@@ -747,10 +917,18 @@ function Terminate-Session {
 }
 
 function Find-HBA-State {
-    
+   
+#   param (
+#       [Parameter(Mandatory=$true)][string]$VMStorageHost
+#    )
+     
 $views = Get-View -ViewType "HostSystem" -Property Name,Config.StorageDevice 
 $result = @()
- 
+#$VMHost
+#Get-VMHostStorage -RescanAllHba -VMHost $VMStorageHost | Out-Null
+
+#Get-vmhost | Get-VMHostStorage -RescanAllHba | Out-Null
+
 foreach ($view in $views | Sort-Object -Property Name) {
     if ($Log) {Write-Logfile "Checking $($view.Name)"}
  
@@ -795,6 +973,9 @@ foreach ($view in $views | Sort-Object -Property Name) {
         $result += $HBAObj
     }
 }
+#write-host $result
+#exit
+
 $result
 #$convertedcsv = ConvertFrom-Csv -Header "VMHost", "HBA", "Active", "Dead", "Standby" , "Inactive" -InputObject $csv | ft -AutoSize
 #$convertedcsv = $csv | ft -AutoSize
@@ -803,63 +984,107 @@ $result
 
 }
 
-function get-licensing-info {
-$licenseArray = @()
-
-#$ServiceInstance = Get-View ServiceInstance
-	#$LicenseMan = Get-View $ServiceInstance.Content.LicenseManager
-    #$LicenseMan | gm
-    #$LicenseFeature=$LicenseMan.QuerySupportedFeatures
-    #$LicenseFeature | fl
-    #$vSphereLicFeatInfo = @()
-	#foreach ($feature in $LicenseMan.FeatureInfo){
-#		$Details = "" |Select Name, Key, ExpiresOn
-#		$Details.Name= $feature.FeatureName
-		#$Details.Key= $feature.Key
-		#$Details.ExpiresOn= $feature.ExpiresOn
-		#$vSphereLicFeatInfo += $Details
-	#}
+function Find-SD-State {
     
-     #$vSphereLicFeatInfo
+$views = Get-View -ViewType "HostSystem" -Property Name,Config.StorageDevice 
+$result = @()
+ 
+foreach ($view in $views | Sort-Object -Property Name) {
+    if ($Log) {Write-Logfile "Checking $($view.Name)"}
+ 
+    $view.Config.StorageDevice.ScsiTopology.Adapter |where{ $_.Adapter -like "*BlockHba-vmhba32*" } | %{
+        #write-host "Adapter is $($_.Adapter)"
+        $hba = $_.Adapter.Split("-")[2]
+ 
+        $active = 0
+        $standby = 0
+        $dead = 0
+        $inactive = 0
+ 
+        $_.Target | %{ 
+            $_.Lun | %{
+                $id = $_.ScsiLun
+ 
+                $multipathInfo = $view.Config.StorageDevice.MultipathInfo.Lun | ?{ $_.Lun -eq $id }
+ 
+                $a = [ARRAY]($multipathInfo.Path | ?{ $_.PathState -like "active*" })
+                $s = [ARRAY]($multipathInfo.Path | ?{ $_.PathState -like "standby" })
+                $d = [ARRAY]($multipathInfo.Path | ?{ $_.PathState -like "dead" })
+                $i = [ARRAY]($multipathInfo.Path | ?{ $_.PathState -like "inactive" })
+
+                $active += $a.Count
+                $standby += $s.Count
+                $dead += $d.Count
+                $inactive += $i.Count
+            }
+        }
+        $HBAObj = New-Object PSObject
+        $HBAObj | Add-Member NoteProperty -Name "VMHost" -Value $view.Name
+        $HBAObj | Add-Member NoteProperty -Name "HBA" -Value $hba
+        $HBAObj | Add-Member NoteProperty -Name "Active" -Value $active
+        $HBAObj | Add-Member NoteProperty -Name "Dead" -Value $dead
+        $HBAObj | Add-Member NoteProperty -Name "Standby" -Value $standby
+        $HBAObj | Add-Member NoteProperty -Name "Inactive" -Value $inactive
+        
+
+
+        #$result += "{0},{1},{2},{3},{4},{5}" -f $view.Name.Split(".")[0], $hba, $active, $dead, $standby, $inactive
+        $csv += "{0},{1},{2},{3},{4},{5}" -f $view.Name, $hba, $active, $dead, $standby, $inactive
+        
+        $result += $HBAObj
+    }
+}
+$result
+}
+
+function get-licensing-key-info {
+$licenseArray = @()
 
 foreach ($licenseManager in (Get-View LicenseManager)){
     $vCenterName = ([System.uri]$licenseManager.Client.ServiceUrl).Host
     #($licenseManager.Client.ServiceUrl -split '/')[2]
-    
     foreach ($license in $licenseManager.Licenses)
     {
+        if ($Log) {Write-Logfile "Checking Licence $($license.Name) Key is $($license.LicenseKey)"}
         #write-host $license.Name -ForegroundColor Yellow
         #$license | fl
         $licenseProp = $license.Properties
         #$licenseProp | fl
+        #exit
         $licenseFeatures = $licenseProp | Where-Object {$_.Key -eq 'Feature'}
+        if ($Log) {Write-Logfile "Licence features:"}
+        #if ($Log) {Write-Logfile "$($licenseFeatures)"}
         foreach ($licenseFeature in $licenseFeatures){
             #$licenseFeature 
             $feature = $licenseFeature | Select-Object -ExpandProperty Value
+            if ($Log) {Write-Logfile "$($feature.Value)"}
             #write-host $feature.Value
             }
-        $licenseExpiryInfo = $licenseProp | Where-Object {$_.Key -eq 'expirationDate'} | Select-Object -ExpandProperty Value
-        if ($license.Name -eq 'Product Evaluation')
-        {
-            $expirationDate = 'Evaluation'
-        } #if ($license.Name -eq 'Product Evaluation')
-        elseif ($null -eq $licenseExpiryInfo)
-        {
-            $expirationDate = 'Never'
-        } #elseif ($null -eq $licenseExpiryInfo)
-        else
-        {
-            $expirationDate = $licenseExpiryInfo
-        } #else #if ($license.Name -eq 'Product Evaluation')
+        #$licenseInfo = $licenseProp | Where-Object {$_.Key -eq 'LicenseInfo'}
+        #$licenseExpiryInfo = $licenseInfo | Where-Object {$_.Key -eq 'expirationDate'} | Select-Object -ExpandProperty Value
+        #write-host $licenseExpiryInfo
+        #if ($license.Name -eq 'Product Evaluation')
+        #{
+        #    #$expirationDate = 'Evaluation'
+        #    $expirationDate = $licenseExpiryInfo
+        #} #if ($license.Name -eq 'Product Evaluation')
+        #elseif ($null -eq $licenseExpiryInfo)
+        #{
+        #    $expirationDate = 'Never'
+        #} #elseif ($null -eq $licenseExpiryInfo)
+        #else
+        #{
+        #    $expirationDate = $licenseExpiryInfo
+        #} #else #if ($license.Name -eq 'Product Evaluation')
     
-        if ($license.Total -eq 0)
-        {
-            $totalLicenses = 'Unlimited'
-        } #if ($license.Total -eq 0)
-        else 
-        {
-            $totalLicenses = $license.Total
-        } #else #if ($license.Total -eq 0)
+        #if ($license.Total -eq 0)
+        #{
+        #    $totalLicenses = 'Unlimited'
+        #} #if ($license.Total -eq 0)
+        #else 
+        #{
+        #    $totalLicenses = $license.Total
+        #} #else #if ($license.Total -eq 0)
     
         $licenseObj = New-Object psobject
         $licenseObj | Add-Member -Name Name -MemberType NoteProperty -Value $license.Name
@@ -882,6 +1107,43 @@ foreach ($licenseManager in (Get-View LicenseManager)){
 $licenseArray
 }
 
+function get-licensing-host-info {
+$HostlicenseArray = @()
+
+
+foreach($vc in $global:DefaultVIServers){
+
+    $licMgr = Get-View LicenseManager -Server $vc
+    $licAssignmentMgr = Get-View -Id $licMgr.LicenseAssignmentManager -Server $vc
+    $AssignedLicenses = $licAssignmentMgr.QueryAssignedLicenses($vc.InstanceUid) | sort EntityDisplayName
+    foreach ($AssignedLicense in $AssignedLicenses){
+            if ($AssignedLicense.AssignedLIcense.LicenseKey){
+            if ($Log) {Write-Logfile "Licence for $($AssignedLicense.EntityDisplayName)"}
+           if ($Log) {Write-Logfile "Licence Key is $($AssignedLicense.AssignedLicense.LicenseKey)"}
+            if ($Log) {Write-Logfile "Licence Name is $($AssignedLicense.AssignedLicense.Name)"}
+            $ExpiryDate = $AssignedLicense.AssignedLicense.Properties.where{$_.Key -eq 'expirationDate'}.Value
+            
+            if (!$ExpiryDate){
+                $ExpiryDate = "Never"
+                }
+            if ($Log) {Write-Logfile "Expiry Date is $($ExpiryDate)"}
+            #write-host "Host is $($AssignedLicense.EntityDisplayName)"
+            #write-host "Key is $($AssignedLicense.AssignedLIcense.LicenseKey)"
+            #write-host "Name is $($AssignedLicense.AssignedLicense.Name)"
+            #write-host "Expiry Date is $($ExpiryDate)"
+            $HostlicenseObj = New-Object psobject
+            $HostlicenseObj | Add-Member -Name Host -MemberType NoteProperty -Value $AssignedLicense.EntityDisplayName
+            $HostlicenseObj | Add-Member -Name vCenter -MemberType NoteProperty -Value $vc
+            $HostlicenseObj | Add-Member -Name LicenseKey -MemberType NoteProperty -Value $AssignedLicense.AssignedLicense.LicenseKey
+            $HostlicenseObj | Add-Member -Name LicenseName -MemberType NoteProperty -Value $AssignedLicense.AssignedLicense.Name
+            $HostlicenseObj | Add-Member -Name LicenseExpiryDate -MemberType NoteProperty -Value $ExpiryDate
+            $HostlicenseArray += $HostlicenseObj
+            }
+        }   
+    }
+
+$HostlicenseArray
+}
 
 function get-VCenter-PSC {
 
@@ -905,17 +1167,38 @@ $ReturnPSC
 
 }
 
+# pass a UTCTime source and it will convert to the locale (UTC+Locale Windows Timezone)
+
+function Convert-UTCtoLocal([parameter(Mandatory=$true)][String]$UTCTime)
+
+{
+  #($tz set in initializing section)
+  if ($Log) {Write-Logfile "Converting $($UTCTime) to timezone $($tz.StandardName)"}
+  try {
+    #$TZ = [System.TimeZoneInfo]::FindSystemTimeZoneById($strCurrentTimeZone);
+    $TZ = [System.TimeZoneInfo]::FindSystemTimeZoneById($tz.StandardName);
+    $LocalTime = [System.TimeZoneInfo]::ConvertTimeFromUtc($UTCTime, $TZ);
+    
+    if ($Log) {Write-Logfile "Resultant time is $($Localtime)"};
+    return $LocalTime;
+    }
+  
+  catch {
+    return $null;
+    }
+
+}
+
 #...................................
 # Script
 #...................................
 #Find run directory 
 $runDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-#$reportemailsubject = "VMware Health Report"
 $ignorelistfile = "$($runDir)\ignorelist.txt"
 
 ################################ Start a transcript log ####################################################
 
-Start-Transcript -Path "$($runDir)\VMware_health_transcript2.log"
+Start-Transcript -Path "$($runDir)\VMware_health_transcript.log"
 
 ################################ Initialise some variables #################################################
 
@@ -965,13 +1248,17 @@ $smtpsettings = @{
     SmtpServer = $smtpserver
     }
 
+#Times on hosts are held in local time so let's work out current offset to GMT from host running this software
+$tz = Get-CimInstance win32_timezone
+#$tz.StandardName
+$GMTOffsetMinutes = ($tz.Bias + $tz.DaylightBias)
+#$GMTOffsetMinutes
+
+
 #...................................
 # Initialize
 #...................................
 
-if (Test-Path "$($OutputFolder)\VMware_Error_Status_Fail.txt"){
-    del "$($OutputFolder)\VMware_Error_Status_Fail.txt"
-    }
 
 #Log file is overwritten each time the script is run to avoid
 #very large log files from growing over time
@@ -989,28 +1276,26 @@ if ($Log) {Write-Logfile "Initializing..."}
 
 #...................................
 # vCenter connection
+
+
 $VCConnection = Connect-VIServer $VCServer -Credential $VCCredential -AllLinked
+
+if ($VCConnection){
+
 $VCServerList = $global:DefaultVIServers
 
-#Get all licensing info
-$VCLicenseArray = get-licensing-info
-#$LicenseRecord = $VCLicenseArray | where {$_."vCenter" -match "nhc1-inf-vcm001.eu.cobham.net" -and $_."LicenseKey" -match "2N617-68K05-Q819X-0D1K4-99W75"}
-#$LicenseRecord | fl
-#write-host "Name is $($LicenseRecord.Name)" -ForegroundColor Yellow
-#write-host "Key is $($LicenseRecord.LicenseKey)"
-#write-host "Vcenter is $($LicenseRecord.vCenter)"
-#$licenseFeatures = @{}
-#$licenseFeatures = $LicenseRecord.licenseFeatures.Value
-#foreach ($licenseFeature in $licenseFeatures){
-#    switch($licenseFeature.Key){
-#                "drs" {write-host "DRS is enabled"}
-#                "dr" {write-host "HA is enabled"}
-#                
-#            }
-#       }
 
-#disconnect-viserver * -confirm:$false
+#Get all licensing info
+#Write-host "VC licences" -foregroundcolor Yellow
+$VCLicenseArray = get-licensing-key-info
+#write-host $VCLicenseArray | ft
 #exit
+#Write-host "Host licences" -foregroundcolor Yellow
+$HostAssignedLicenseArray = get-licensing-host-info
+#$HostAssignedLicenseArray
+
+#exit
+
 
 #Get all cluster information
 $VCClusters = get-cluster | select-object Name,HAEnabled,HAAdmissionControlEnabled,DRSEnabled,@{N="NumberofHosts";E={($_ | Get-VMHost).Count}}
@@ -1021,14 +1306,21 @@ $VCDatacenters = get-datacenter | select-object Name,@{N="NumberofHosts";E={($_ 
 if ($Log) {Write-Logfile "Processing Datacenters"}
 
 #Get all HBA states
+
 $HBApathstates = Find-HBA-State
-#$HBApathstates 
+
+
 if ($Log) {Write-Logfile "Processing HBAs"}
 foreach ($HBApathstate in $HBApathstates){
     if ($Log) {Write-Logfile "$($HBApathstate.VMHost),$($HBApathstate.HBA),$($HBApathstate.Active),$($HBApathstate.Dead),$($HBApathstate.Standby),$($HBApathstate.Inactive)"}
     }
 
-#exit
+#Get all SD card states
+$SDstates = Find-SD-State
+if ($Log) {Write-Logfile "Processing SD card adapters"}
+foreach ($SDstate in $SDstates){
+    if ($Log) {Write-Logfile "$($SDstate.VMHost),$($SDstate.HBA),$($SDstate.Active),$($SDstate.Dead),$($SDstate.Standby),$($SDstate.Inactive)"}
+    }
 #...................................
 #Grab ESXi Hosts
 $VMHosts = Get-VMHost | sort-object -Property Name
@@ -1036,9 +1328,11 @@ $VMHosts = Get-VMHost | sort-object -Property Name
 
 #Find all VCs on this connection
 
+
 #$VCServers = $global:DefaultVIServers
 $VCStatus = @{}
 foreach ($VCServer in $VCConnection){
+    
     $VCStatusOK = $true
     $VCStatus.Add($VCServer.Name,"Pass")
     write-host "Processing vCenter $($VCServer)"
@@ -1091,24 +1385,104 @@ foreach ($VCServer in $VCConnection){
 
         }While ($correctToken -eq 1)  
 
+    
+    #exit
     ##Get the vCSA version 
     write-host "VCSA Version"
     if ($Log) {Write-Logfile "VCSA Version"}
     $vcsaVersion = $VCServer.Version
     write-host $vcsaVersion
     if ($Log) {Write-Logfile $vcsaVersion}
+    #Find any non-running services
     write-host "non-running services"
     if ($Log) {Write-Logfile "non-running services"}
-    $NonRunningVMONServices = Get-vMon-Services -AuthTokenValue $FuncAuthToken | where {$_.State -ne "STARTED" -and $_.'Startup Type' -ne "MANUAL" -and $_.'Startup Type' -ne "DISABLED"} | Select "Service Name"
+    $NonRunningVMONServices = Get-vMon-Services -AuthTokenValue $FuncAuthToken | where {$_.State -ne "STARTED" -and $_.'Startup Type' -ne "MANUAL" -and $_.'Startup Type' -ne "DISABLED"} | Select "ServiceName"
     if ($NonRunningVMONServices){
         write-host "Services not running"
-        $serversummary += "Service not running on vCenter $($vCenterFQDN): $($NonRunningVMONServices."Service Name")"
-        $VCStatus[$VCServer.Name] = "Fail"
-        $VCStatusOK = $fail
-        
+        foreach ($NonRunningVMONService in $NonRunningVMONServices){
+            if ($NonRunningVMONService.ServiceName -notin $IgnoreVCServices){
+                $serversummary += "Service not running on vCenter $($vCenterFQDN): $($NonRunningVMONService.ServiceName)"
+                $VCStatus[$VCServer.Name] = "Fail"
+                $VCStatusOK = $fail
+                }
+            else{
+                if ($Log) {Write-Logfile "Non-running service $($NonRunningVMONService.ServiceName) in Ignore list"}
+                }
+            }
         }
    
-   #Does this VC have an external PSC - if so name it
+   #Get VC HA status if configured
+   
+   $VCHAStatus = get-vchaconfig $VCServer
+   if ($Log) {Write-Logfile "VCHA status for $($vCenterFQDN) is $($VCHAStatus)"}
+   write-host "VCHA status for $($vCenterFQDN) is $($VCHAStatus)"
+   if ($VCHAStatus -notmatch "Healthy"){
+        if ($Log) {Write-Logfile "VCenter HA not healthy on vCenter $($vCenterFQDN)"}
+        $serversummary += "VCenter HA not healthy on vCenter $($vCenterFQDN)"
+        $VCStatus[$VCServer.Name] = "Fail"
+        $VCStatusOK = $fail
+        }
+   
+    #Get VC licence details
+    #$VCServer | fl
+    $ThisVCsLicenseEntry = $HostAssignedLicenseArray | where {$_.Host -match $VCServer.Name -and $_.vCenter -match $VCserver}
+    #write-host "ThisVCsLicenseEntry is $($ThisVCsLicenseEntry)"
+    if ($Log) {Write-Logfile "This vCenters licence entry is $($ThisVCsLicenseEntry)"} 
+    if ($Log) {Write-Logfile "This vCenters licence expiry is $($ThisVCsLicenseEntry.LicenseExpiryDate)"}
+    if ($ThisVCsLicenseEntry.LicenseExpiryDate -notmatch "Never"){
+        $LicenseExpiring = [math]::round((New-TimeSpan -Start (Get-Date) -End $ThisVCsLicenseEntry.LicenseExpiryDate).TotalDays,0) 
+        write-host "VC licence will expire in $($LicenseExpiring) days" -ForegroundColor Red
+        if ($LicenseExpiring -lt $CertificateTimeToAlert){
+            if ($Log) {Write-Logfile "$($VCServer) license will expire in $($LicenseExpiring) days on $($ThisVCsLicenseEntry.LicenseExpiryDate)"}
+            $serversummary += "$($VCServer) license will expire in $($LicenseExpiring) days on $($ThisVCsLicenseEntry.LicenseExpiryDate)"
+            $VCStatus[$VCServer.Name] = "Fail"
+            $VCStatusOK = $fail
+            }
+        }
+   #$vCenterHAStatus = Get-vCSA-HA-Status -AuthTokenValue $FuncAuthToken
+   ##write-host $vCenterHAStatus
+   #if ($vCenterHAStatus.config_state -like "CONFIGURED"){
+   # if ($Log) {Write-Logfile "VCHA configured:"}
+   # if ($Log) {Write-Logfile "mode:$($vCenterHAStatus.mode)"}
+   # if ($Log) {Write-Logfile "health_state:$($vCenterHAStatus.health_state)"}
+   # if ($Log) {Write-Logfile "witness:$($vCenterHAStatus.witness)"}
+   # if ($Log) {Write-Logfile "manual_failover_allowed:$($vCenterHAStatus.manual_failover_allowed)"}
+   # if ($Log) {Write-Logfile "auto_failover_allowed:$($vCenterHAStatus.auto_failover_allowed)"}
+   # if ($vCenterHAStatus.health_state -notmatch "HEALTHY"){
+   #     if ($Log) {Write-Logfile "VCenter HA not healthy on vCenter $($vCenterFQDN)"}
+   #     $serversummary += "VCenter HA not healthy on vCenter $($vCenterFQDN)"
+   #     $VCStatus[$VCServer.Name] = "Fail"
+   #     $VCStatusOK = $fail
+   #     }
+   # }  
+   #else{
+   # if ($Log) {Write-Logfile "VCHA not configured"}
+   # }
+   ##exit
+   #$VCConnection.Count 
+    #if (([regex]::match($vcsaVersion ,"6.7")).success){
+    #    if ($Log) {Write-Logfile "Version 6.7 - cannot check replication status"}
+    #    }
+    #else{
+        if ($VCServerList.Count -gt 1){
+           $vCenterReplicationStatus = Get-vCSA-Replication-Status -AuthTokenValue $FuncAuthToken 
+            #write-host $vCenterReplicationStatus
+            #Invoke-ListTopologyReplicationStatus
+            if ($Log) {Write-Logfile $vCenterReplicationStatus}
+            foreach ($ReplicationNode in $vCenterReplicationStatus){
+                #write-host "Node is $($ReplicationNode.Node)" 
+                #if ($ReplicationNode.status_available -match "False" -or $ReplicationNode.partner_available -match "False" -or $ReplicationNode.replicating -match "False" -or $ReplicationNode.change_lag -gt $MaxReplicationItemsLagging){
+                if ($ReplicationNode.status_available -match "False" -or $ReplicationNode.partner_available -match "False" -or $ReplicationNode.change_lag -gt $MaxReplicationItemsLagging){
+                    write-host "Replication showing errors for $($ReplicationNode.Node) and replication partner $($ReplicationNode.replication_partner)" -ForegroundColor Red
+                    if ($Log) {Write-Logfile "Replication showing errors for $($ReplicationNode.Node) and replication partner $($ReplicationNode.replication_partner)"}
+                    $serversummary += "Replication not running correctly on vCenter $($vCenterFQDN): Replication partner $($ReplicationNode.replication_partner): $($vCenterReplicationStatus)"
+                    $VCStatus[$VCServer.Name] = "Fail"
+                    $VCStatusOK = $fail
+                    }
+                }
+            }
+        #}
+   #Does this VC have an external PSC - if so name them
    $VC_PSCs = get-VCenter-PSC
    #$VC_PSCs 
 
@@ -1132,7 +1506,7 @@ foreach ($VCServer in $VCConnection){
                 }
             catch{
                 Write-Host "Wrong Username or Password" -ForegroundColor Red
-                if ($Log) {Write-Logfile "Wrong Username or Password"}
+                if ($Log) {Write-Logfile "Wrong Username or Password - or maybe shell is not set to bash shell"}
                 Start-Sleep -Seconds 2
                 }
             $vcsaHealthStatus = Get-Health-Status -AuthTokenValue $FuncAuthToken #| where {$_.Definition -contains "green"}
@@ -1197,9 +1571,11 @@ foreach ($VCServer in $VCConnection){
                 #write-host -object "$MountPoint is $UsePercentage% used"
                 if ($Log) {Write-Logfile "$MountPoint is $UsePercentage% used"}
                 if ($UsePercentage -gt $PartitionPercentFull){
-                    $serversummary += "$($vCenterFQDN) - Disk Space on mountpoint /$($MountPoint) is $($UsePercentage)% used"
-                    $VCStatus[$VCServer.Name] = "Fail"
-                    $VCStatusOK = $fail
+                    if ($MountPoint -notlike "/dev/mapper/archive_vg-archive"){
+                        $serversummary += "$($vCenterFQDN) - Disk Space on mountpoint $($MountPoint) is $($UsePercentage)% used"
+                        $VCStatus[$VCServer.Name] = "Fail"
+                        $VCStatusOK = $fail
+                        }
                     }
                 }
         
@@ -1231,6 +1607,15 @@ foreach ($VCServer in $VCConnection){
 $VCStatus 
 #exit
 foreach($VMHost in $VMHosts){ 
+    
+    #$VMHost | fl
+    $esxcli = Get-VMHost $VMHost | Get-EsxCLI -V2
+    $IPMI = $esxcli.hardware.ipmi.bmc.get.Invoke()
+    #$IPMI | fl
+    #exit
+    if ($Log) {Write-Logfile "IPMI address is $($IPMI.IPv4Address)"}
+    if ($Log) {Write-Logfile "IPMI manufacturer is $($IPMI.Manufacturer)"}
+    #Do list - Add functionality to examine IPMI card for failures ILO/DraC/UCSM
     if ($VMHost -notin $IgnoreHosts){
         Write-Host "Processing $($VMHost)" -ForegroundColor Blue 
         #$FullDetails = $VMHost | fl
@@ -1346,9 +1731,27 @@ foreach($VMHost in $VMHosts){
     
         #Uptime Check
         Write-Host "Uptime (hrs): " -NoNewline
+        #Get-View -ViewType hostsystem -Property name,runtime.boottime | Select-Object Name, @{N="UptimeDays"; E={((((get-date) - ($_.runtime).BootTime).TotalDays).Tostring()).Substring(0,5)}}
+        #$uptime = Get-View -ViewType hostsystem -Property name,runtime.boottime | where {$_.Name -eq $VMHost.Name}| Select-Object Name, @{N="UptimeHours"; E={((((get-date) - ($_.runtime).BootTime).TotalHours))}}
+        $boottime = Get-View -ViewType hostsystem -Property name,runtime.boottime | where {$_.Name -eq $VMHost.Name} #|  Select-Object Name,($_.runtime).BootTime
+        #$boottime.runtime.boottime.datetime
+        #exit
         if ($Log) {Write-Logfile "Uptime (hrs): "}
         [int]$uptimehours = $null
-        $uptimehours = [math]::round((New-TimeSpan -Start $VMHost.ExtensionData.Summary.Runtime.BootTime -End (Get-Date)).TotalHours,0) #| Select-Object -ExpandProperty Days
+        #write-host "Run time is $($VMHost.ExtensionData.Summary.Runtime)"
+        #write-host "Run time is $($VMHost.Runtime)"
+        #write-host "Boot time is $($VMHost.ExtensionData.Summary.Runtime.BootTime)"
+        #write-host "Boot time is $($VMHost.Runtime.BootTime)"
+        #exit
+        write-host "Boot time is $($boottime.runtime.boottime.datetime)"
+        #if ($Log) {Write-Logfile "Boot time is $($VMHost.ExtensionData.Summary.Runtime.BootTime)"}
+        if ($Log) {Write-Logfile "Boot time is $($boottime.runtime.boottime.datetime)"}
+        #$BootUTCTime = Convert-UTCtoLocal -UTCTime $VMHost.ExtensionData.Summary.Runtime.BootTime
+        $BootUTCTime = $boottime.runtime.boottime.datetime
+        #$BootUTCTime =  $boottime.runtime.boottime.datetime.touniversaltime()
+        if ($Log) {Write-Logfile "Boot time (UTC) is $($BootUTCTime)"}
+        if ($Log) {Write-Logfile "Date/time UTC now is $((Get-Date).ToUniversalTime())"}
+        $uptimehours = [math]::round((New-TimeSpan -Start $BootUTCTime -End ((Get-Date).ToUniversalTime())).TotalHours,0) #| Select-Object -ExpandProperty Days
         #Write-Host "up for $($uptimehours)"
         if ($Log) {Write-Logfile "up for $($uptimehours)"}
         if ($Log) {Write-Logfile "Minimum uptime is $($MinimumUptime)"}
@@ -1378,11 +1781,14 @@ foreach($VMHost in $VMHosts){
         $VMHAlarms = @()
         #$WholeView = ($VMHost | Get-View)
         #$WholeView
-        $VMHostStatus = ($VMHost | Get-View) | where {$_.OverallStatus -ne "Green" -or $_.ConfigStatus -ne "Green"} | Select-Object Name,OverallStatus,ConfigStatus,TriggeredAlarmState | sort -property Name | get-unique
+        #$VMHostStatus = ($VMHost | Get-View) | where {$_.OverallStatus -ne "Green" -or $_.ConfigStatus -ne "Green"} | Select-Object Name,OverallStatus,ConfigStatus,TriggeredAlarmState | sort -property Name | get-unique
+        #$VMHostStatus = Get-View -ViewType hostsystem -Property Name,OverallStatus,ConfigStatus,TriggeredAlarmState  | where {$_.Name -eq $VMHost.Name}
         #$VMHostStatus | fl
-    
+        $VMHostStatus = Get-View -ViewType hostsystem -Property Name,OverallStatus,ConfigStatus,TriggeredAlarmState  | where {$_.Name -eq $VMHost.Name} | where {$_.OverallStatus -ne "Green" -or $_.ConfigStatus -ne "Green"} | Select-Object Name,OverallStatus,ConfigStatus,TriggeredAlarmState | sort -property Name | get-unique
+        #$VMHostStatus | fl
         if ($VMHostStatus){
-            foreach($TriggeredAlarm in ($HostStatus.TriggeredAlarmstate | sort | get-unique)){
+            #write-host "Triggered alarms!"
+            foreach($TriggeredAlarm in ($VMHostStatus.TriggeredAlarmstate | sort | get-unique)){
                 foreach ($Alarm in ($TriggeredAlarm.Alarm| sort | get-unique)){
                     $TriggeredAlarmName = (Get-AlarmDefinition -Id $Alarm) | get-unique | select $_.Name
                     #write-host "Triggered alarm name is $($TriggeredAlarmName)"
@@ -1491,7 +1897,7 @@ foreach($VMHost in $VMHosts){
         $VMErrors = @()
         $HostVMs = ($VMHost |Get-VM | Get-View)
     
-        $BadVMs = $HostVMs  | where {$_.RunTime.ConnectionState -ne "connected"} | select name 
+        $BadVMs = $HostVMs  | where {$_.RunTime.ConnectionState -ne "connected"} | where {$_.Name -notin $IgnoreVMs} | select name 
         if ($BadVMs){
             $VMErrors += "Bad Connection State VM(s): $($BadVMs.Name)"
             }
@@ -1515,14 +1921,24 @@ foreach($VMHost in $VMHosts){
 
         Write-Host "Host Services: " -NoNewline
         if ($Log) {Write-Logfile "Host Services: "}
-        $ERRORS = $null
-          
-        $ERRORS +=  Check_VMHost_Running_Services $VMHost
-        $ERRORS 
+        $ServiceErrors = $null
+        
+        
     
-        Switch (!$ERRORS) {
-            $true { Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Services" -Value "Pass" -Force}
-            default { Write-Host -ForegroundColor $fail $ERRORS; $serversummary += "$($VMHost) - Service(s) $($ERRORS)";$serverObj | Add-Member NoteProperty -Name "Services" -Value "Fail" -Force}
+        if($VMHost.ConnectionState -eq "Maintenance"){
+	        write-host "The host is in maintenance mode"
+	        if ($Log) {Write-Logfile "$($VMHost) is in maintenance mode"}
+            Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Services" -Value "Pass" -Force
+            }
+        else{
+            $ServiceErrors +=  Check_VMHost_Running_Services $VMHost
+            #$ERRORS 
+
+            
+            Switch (!$ServiceErrors) {
+                $true { Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Services" -Value "Pass" -Force}
+                default { Write-Host -ForegroundColor $fail "$($ServiceErrors) not running"; $serversummary += "$($VMHost) - Service(s) $($ServiceErrors) not running";$serverObj | Add-Member NoteProperty -Name "Services" -Value "Fail" -Force}
+                }
             }
         
         #Check Networks
@@ -1581,113 +1997,111 @@ foreach($VMHost in $VMHosts){
         #If the host is in a cluster check for vMotion enabled
         $ThisCluster = Get-cluster -VMHost $VMHost
         #write-host "Cluaster is $($ThisCluster)"
-        #Lookup license key and it's capabilities
-        $LicenseRecord = $VCLicenseArray | where {$_."vCenter" -match $vCenter -and $_."LicenseKey" -match $VMHost.LicenseKey}
-        #$LicenseRecord = $VCLicenseArray | where {$_."vCenter" -match "nhc1-inf-vcm001.eu.cobham.net" -and $_."LicenseKey" -match "2N617-68K05-Q819X-0D1K4-99W75"}
-        #$LicenseRecord | fl
-        #write-host "License Name is $($LicenseRecord.Name)" -ForegroundColor Yellow
-        if ($Log) {Write-Logfile "License Name is $($LicenseRecord.Name)"}
-        #write-host "Key is $($LicenseRecord.LicenseKey)"
-        if ($Log) {Write-Logfile "License Key is $($LicenseRecord.LicenseKey)"}
-        #write-host "Vcenter is $($LicenseRecord.vCenter)"
-        if ($Log) {Write-Logfile "vCenter is $($LicenseRecord.vCenter)"}
-        $licenseFeatures = @{}
-        $licenseFeatures = $LicenseRecord.licenseFeatures.Value
-        $DRSLicensed = $false
-        $HALicensed = $false
-        foreach ($licenseFeature in $licenseFeatures){
-            switch($licenseFeature.Key){
-                        "drs" {$DRSLicensed = $true;if ($Log) {Write-Logfile "DRS is licensed"}}
-                        "dr" {$HALicensed = $true;if ($Log) {Write-Logfile "HA is licensed"}}
-                
-                    }
-               }
-        
-        if ($ThisCluster){
-            $vMotionenabled = $VMHost | Get-VMHostNetworkAdapter |  Where {$_.VMotionEnabled}
-            if ($Log) {Write-Logfile "Host is in cluster $($ThisCluster)"}
-        
-            if (!$vMotionenabled){
-                #Check if this is the only host in this datacenter
-                #$VMHost | fl
-                $VMDatacenter = Get-Datacenter -VMHost $VMHost
-                #write-host "dataCenter is $($VMDatacenter.Name)"
-                if ($Log) {Write-Logfile "dataCenter is $($VMDatacenter.Name)"}
-                #if ((Get-Datacenter $VMDatacenter.Name | Get-VMHost).Count -gt 1) {
-                if (($VCDatacenters | where {$_.Name -match $VMDatacenter.Name}).NumberofHosts -gt 1) {
-                    #write-host "more than 1 on dc"
-                    if ($Log) {Write-Logfile "more than 1 on dc"}
-                    #write-host "No vMotion Network on $VMHost" -ForegroundColor Red
-                    if ($Log) {Write-Logfile "No vMotion Network on $VMHost"}
-                    $NetworkErrors += "No vMotion Network on $VMHost"
+        #Lookup license key and it's capabilities and check for expiration
+        if ($Log) {Write-Logfile "License for this host is $($VMHost.LicenseKey)"}
+        if ($VMHost.LicenseKey){
+            $LicenseRecord = $VCLicenseArray | where {$_."vCenter" -match $vCenter -and $_."LicenseKey" -match $VMHost.LicenseKey}
+            $ThisHostsLicenseEntry = $HostAssignedLicenseArray | where {$_.Host -match $VMHost.Name -and $_.vCenter -match $vCenter}
+            if ($Log) {Write-Logfile "This hosts licence entry is $($ThisHostsLicenseEntry)"} 
+            if ($Log) {Write-Logfile "This hosts licence expiry is $($ThisHostsLicenseEntry.LicenseExpiryDate)"}
+            if ($ThisHostsLicenseEntry.LicenseExpiryDate -notmatch "Never"){
+                $LicenseExpiring = [math]::round((New-TimeSpan -Start (Get-Date) -End $ThisHostsLicenseEntry.LicenseExpiryDate).TotalDays,0) 
+                write-host "Host licence will expire in $($LicenseExpiring) days" -ForegroundColor Red
+                if ($LicenseExpiring -lt $CertificateTimeToAlert){
+                    $NetworkErrors += "$($VMHost) license will expire in $($LicenseExpiring) days on $($ThisHostsLicenseEntry.LicenseExpiryDate)"
                     }
                 }
-            if ($Log) {Write-Logfile "Cluster is $($ThisCluster)"}
-            #Check if the cluster has more than 2 hosts (if not ignore HA/DRS settings)
-            $VMCluster = $VCClusters | where {$_.Name -match $ThisCluster}
-            #if ((Get-Cluster $VMCluster | Get-VMHost).Count -gt 1){
-            if ($VMCluster.NumberofHosts -gt 1) {
-                #write-host "Cluster $($VMCluster.Name) has more than 1 host so investigate HA and DRS settings"
-                if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) has more than 1 host so investigate HA and DRS settings"}
-                if (!$VMCluster.DrsEnabled) {
-                    if ($DRSLicensed){
-                        $NetworkErrors += "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled but it is licensed"
-                        #write-host "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled"
-                        if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled but it is licensed"}
+                  
+            
+            
+            #write-host "License Name is $($LicenseRecord.Name)" -ForegroundColor Yellow
+            if ($Log) {Write-Logfile "License Name is $($LicenseRecord.Name)"}
+            #write-host "Key is $($LicenseRecord.LicenseKey)"
+            if ($Log) {Write-Logfile "License Key is $($LicenseRecord.LicenseKey)"}
+            #write-host "Vcenter is $($LicenseRecord.vCenter)"
+            if ($Log) {Write-Logfile "vCenter is $($LicenseRecord.vCenter)"}
+            $licenseFeatures = @{}
+            $licenseFeatures = $LicenseRecord.licenseFeatures.Value
+            $DRSLicensed = $false
+            $HALicensed = $false
+            foreach ($licenseFeature in $licenseFeatures){
+                switch($licenseFeature.Key){
+                            "drs" {$DRSLicensed = $true;if ($Log) {Write-Logfile "DRS is licensed"}}
+                            "dr" {$HALicensed = $true;if ($Log) {Write-Logfile "HA is licensed"}}
+                
                         }
-                    else{
-                        if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled and it is not licensed"}
-                        }
-                    }
-                if (!$VMCluster.HAEnabled) {
-                    if ($HALicensed){
-                        $NetworkErrors += "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled but it is licensed"
-                        #write-host "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled"
-                        if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled but it is licensed"}
-                        }
-                    else{
-                        if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled and it is not licensed"}
-                        }
-                    }
+                   }
         
-                if (!$VMCluster.HAAdmissionControlEnabled) {
-                    if ($HALicensed){
-                        $NetworkErrors += "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled but it is licensed"
-                        #write-host "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled"
-                        if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled but it is licensed"}
-                        }
-                    else{
-                        if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled and it is not licensed"}
+            if ($ThisCluster){
+                $vMotionenabled = $VMHost | Get-VMHostNetworkAdapter |  Where {$_.VMotionEnabled}
+                if ($Log) {Write-Logfile "Host is in cluster $($ThisCluster)"}
+        
+                if (!$vMotionenabled){
+                    #Check if this is the only host in this datacenter
+                    #$VMHost | fl
+                    $VMDatacenter = Get-Datacenter -VMHost $VMHost
+                    #write-host "dataCenter is $($VMDatacenter.Name)"
+                    if ($Log) {Write-Logfile "dataCenter is $($VMDatacenter.Name)"}
+                    #if ((Get-Datacenter $VMDatacenter.Name | Get-VMHost).Count -gt 1) {
+                    if (($VCDatacenters | where {$_.Name -match $VMDatacenter.Name}).NumberofHosts -gt 1) {
+                        #write-host "more than 1 on dc"
+                        if ($Log) {Write-Logfile "more than 1 on dc"}
+                        #write-host "No vMotion Network on $VMHost" -ForegroundColor Red
+                        if ($Log) {Write-Logfile "No vMotion Network on $VMHost"}
+                        $NetworkErrors += "No vMotion Network on $VMHost"
                         }
                     }
+                if ($Log) {Write-Logfile "Cluster is $($ThisCluster)"}
+                #Check if the cluster has more than 2 hosts (if not ignore HA/DRS settings)
+                $VMCluster = $VCClusters | where {$_.Name -match $ThisCluster}
+                #if ((Get-Cluster $VMCluster | Get-VMHost).Count -gt 1){
+                if ($VMCluster.NumberofHosts -gt 1) {
+                    #write-host "Cluster $($VMCluster.Name) has more than 1 host so investigate HA and DRS settings"
+                    if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) has more than 1 host so investigate HA and DRS settings"}
+                    if (!$VMCluster.DrsEnabled) {
+                        if ($DRSLicensed){
+                            $NetworkErrors += "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled but it is licensed"
+                            #write-host "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled"
+                            if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled but it is licensed"}
+                            }
+                        else{
+                            if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have DRS enabled and it is not licensed"}
+                            }
+                        }
+                    if (!$VMCluster.HAEnabled) {
+                        if ($HALicensed){
+                            $NetworkErrors += "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled but it is licensed"
+                            #write-host "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled"
+                            if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled but it is licensed"}
+                            }
+                        else{
+                            if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA enabled and it is not licensed"}
+                            }
+                        }
         
-            }
+                    if (!$VMCluster.HAAdmissionControlEnabled) {
+                        if ($HALicensed){
+                            $NetworkErrors += "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled but it is licensed"
+                            #write-host "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled"
+                            if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled but it is licensed"}
+                            }
+                        else{
+                            if ($Log) {Write-Logfile "Cluster $($VMCluster.Name) for $($VMHost) does not have HA Admission Control enabled and it is not licensed"}
+                            }
+                        }
+        
+                }
        
-        }
-        else{
-            if ($Log) {Write-Logfile "Host is not in any cluster"}
             }
-        #Find bad paths on HBAs
-        #Get-VMHostStorage -RescanAllHba -VMHost $VMHost | Out-Null
-        
-        [ARRAY]$HBAs = $VMHost | Get-VMHostHba -Type "FibreChannel"
-        if ($HBAs){
-            #write-host "Examining HBAs on $($VMHost)"
-            if ($Log) {Write-Logfile "Examining HBAs on $($VMHost)"}
-        
-            #Find-HBA-State -HostName $VMHost
-            $BadHBAStates = $HBApathstates | where {$_.VMHost -match $VMHost -and ($_.Dead -gt 0 -or $_.Inactive -gt 0)}
-            if ($Log) {Write-Logfile "$($BadHBAStates)"}
-            foreach ($BadHBAState in $BadHBAStates){
-                $NetworkErrors += "There are dead/standby/inactive paths on $($BadHBAState.HBA) on $($VMHost)"
-                #write-host "There are dead/standby/inactive paths on $($BadHBAState.HBA) on $($VMHost)"
-                if ($Log) {Write-Logfile "There are dead/standby/inactive paths on $($BadHBAState.HBA) on $($VMHost)"}
+            else{
+                if ($Log) {Write-Logfile "Host is not in any cluster"}
                 }
-                
-            #exit
-            }
-          
         
+            }
+        else{
+            if ($Log) {Write-Logfile "$($VMHost) does not have a license key allocated"}
+            $NetworkErrors += "$($VMHost) does not have a license key allocated"
+            }
         Switch (!$NetworkErrors) {
             $true { Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Network" -Value "Pass" -Force}
             default { Write-Host -ForegroundColor $fail $NetworkErrors; $serversummary += "$($VMHost) - VMware Host Network Error(s) $($NetworkErrors)";$serverObj | Add-Member NoteProperty -Name "Network" -Value "Fail" -Force}
@@ -1695,29 +2109,77 @@ foreach($VMHost in $VMHosts){
     
         #Hardware Health
         Write-Host "Host Hardware: " -NoNewline
-        if ($Log) {Write-Logfile "Host Hardware: "}
-        $HardwareErrors = @()
-        $hs = $SensorInfo = $MemoryInfo = $CPUInfo= $StorageInfo = $null
-        $hs = Get-View -Id $VMHost.ExtensionData.ConfigManager.HealthStatusSystem
-        $SensorInfo = $hs.Runtime.SystemHealthInfo.NumericSensorInfo | where{$_.HealthState.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} | Select @{N='Host';E={$VMHost.Name}},Name,@{N='Health';E={$_.HealthState.Label}}
-        if ($SensorInfo){
-            $HardwareErrors += $SensorInfo
+        if ($VMHost -in $IgnoreHardwareErrors){
+            if ($Log) {Write-Logfile "Host in $($IgnoreHardwareErrors) array - Not checking for hardware errors on $($VMHost)"}
+            $HardwareErrors = $null
+            } 
+        else{
+            if ($Log) {Write-Logfile "Host Hardware: "}
+            $HardwareErrors = @()
+            $hs = $SensorInfo = $MemoryInfo = $CPUInfo= $StorageInfo = $null
+            #$HostHardwareStatus = Get-View -ViewType hostsystem -Property ConfigManager
+            #$HostHardwareStatus
+            #$HostHardwareStatus.HealthStatusSystem
+            #$HostView = Get-VMHost -Name $VMHost.Name | Get-View
+            #$HealthStatusSystem = Get-View $HostView.ConfigManager.HealthStatusSystem
+            #$HealthStatusSystem
+            $hs = Get-View -ViewType hostsystem -Property ConfigManager.HealthStatusSystem | where {$_.Name -eq $VMHost.Name} 
+            #$hs | fl
+            #$hs = Get-View -Id $VMHost.ExtensionData.ConfigManager.HealthStatusSystem
+            $SensorInfo = $hs.Runtime.SystemHealthInfo.NumericSensorInfo | where{$_.HealthState.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} | Select @{N='Host';E={$VMHost.Name}},Name,@{N='Health';E={$_.HealthState.Label}}
+            #$SensorInfo | fl
+            if ($SensorInfo){
+                $HardwareErrors += $SensorInfo
+                }
+            $MemoryInfo = $hs.Runtime.HardwareStatusInfo.MemoryStatusInfo.Status | where{$_.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} 
+            #$MemoryInfo | fl
+            if ($MemoryInfo){
+                $HardwareErrors += "Memory Fault $($MemoryInfo.Summary)"
+                }
+            #$hs.Runtime.HardwareStatusInfo.CPUStatusInfo.Status
+            $CPUInfo = $hs.Runtime.HardwareStatusInfo.CPUStatusInfo.Status | where{$_.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} 
+            if ($CPUInfo){
+                $HardwareErrors += "CPU Fault $($CPUInfo.Summary)"
+                }
+            $StorageInfo = $hs.Runtime.HardwareStatusInfo.StorageStatusInfo.Status | where{$_.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} 
+            #$StorageInfo = $hs.Runtime.HardwareStatusInfo.StorageStatusInfo | where{$_.Status.Label -notmatch "Green|Unknown" -and $_.Status.Name -notmatch 'Rollup'} 
+            if ($StorageInfo){
+                $HardwareErrors += "Storage Fault $($StorageInfo.Summary)"
+                }
+            
+            #exit
+            #Find bad paths on HBAs
+            #Get-VMHostStorage -RescanAllHba -VMHost $VMHost | Out-Null
+        
+            [ARRAY]$HBAs = $VMHost | Get-VMHostHba -Type "FibreChannel"
+            if ($HBAs){
+                #write-host "Examining HBAs on $($VMHost)"
+                if ($Log) {Write-Logfile "Examining HBAs on $($VMHost)"}
+        
+                #Find-HBA-State -HostName $VMHost
+                $BadHBAStates = $HBApathstates | where {$_.VMHost -match $VMHost -and ($_.Dead -gt 0 -or $_.Inactive -gt 0)}
+                if ($Log) {Write-Logfile "$($BadHBAStates)"}
+                foreach ($BadHBAState in $BadHBAStates){
+                    $HardwareErrors += "There are dead/standby/inactive paths on $($BadHBAState.HBA) on $($VMHost)"
+                    #write-host "There are dead/standby/inactive paths on $($BadHBAState.HBA) on $($VMHost)"
+                    if ($Log) {Write-Logfile "There are dead/standby/inactive paths on $($BadHBAState.HBA) on $($VMHost)"}
+                    }
+                
+                #exit
+                }
+         
+            #Is the SD card adapter working?
+            if ($Log) {Write-Logfile "Examining SD Storage Adapter on $($VMHost)"}
+            $BadSDStates = $SDstates | where {$_.VMHost -match $VMHost -and ($_.Dead -gt 0)}
+            if ($Log) {Write-Logfile "$($BadSDStates)"}
+            foreach ($BadSDState in $BadSDStates){
+                $HardwareErrors += "$($BadSDState.HBA) on $($VMHost) is not working correctly"
+                if ($Log) {Write-Logfile "$($BadSDState.HBA) on $($VMHost) is not working correctly"}
+                }
+        
+        
             }
-        $MemoryInfo = $hs.Runtime.HardwareStatusInfo.MemoryStatusInfo.Status | where{$_.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} 
-        #$MemoryInfo | fl
-        if ($MemoryInfo){
-            $HardwareErrors += "Memory Fault $($MemoryInfo.Summary)"
-            }
-        #$hs.Runtime.HardwareStatusInfo.CPUStatusInfo.Status
-        $CPUInfo = $hs.Runtime.HardwareStatusInfo.CPUStatusInfo.Status | where{$_.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} 
-        if ($CPUInfo){
-            $HardwareErrors += "CPU Fault $($CPUInfo.Summary)"
-            }
-        $StorageInfo = $hs.Runtime.HardwareStatusInfo.StorageStatusInfo.Status | where{$_.Label -notmatch "Green|Unknown" -and $_.Name -notmatch 'Rollup'} 
-        #$StorageInfo = $hs.Runtime.HardwareStatusInfo.StorageStatusInfo | where{$_.Status.Label -notmatch "Green|Unknown" -and $_.Status.Name -notmatch 'Rollup'} 
-        if ($StorageInfo){
-            $HardwareErrors += "Storage Fault $($StorageInfo.Summary)"
-            }
+        
         Switch (!$HardwareErrors) {
             $true { Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Pass" -Force}
             default { Write-Host -ForegroundColor $fail $HardwareErrors; $serversummary += "$($VMHost) - VMware Host Hardware Error(s) $($HardwareErrors)";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Fail" -Force}
@@ -1760,9 +2222,9 @@ foreach($VMHost in $VMHosts){
                         [int]$UsePercentage = ($line.Substring(51,5)).trim().replace("%","")
                         #write-host -object "$MountPoint is $UsePercentage % used"
                         if ($Log) {Write-Logfile "$MountPoint is $UsePercentage % used"}
-                        if ($UsePercentage -gt $PartitionPercentFull){
+                        if ($UsePercentage -gt $PartitionPercentFull -and $MountPoint -notmatch "upgradescratch"){
                             #write-host "$MountPoint is $UsePercentage % used" -ForegroundColor Red
-                            $serversummary += "$($VMHost) - Disk Space on mountpoint /$($MountPoint) is $($UsePercentage) % used"
+                            $serversummary += "$($VMHost) - Disk Space on mountpoint $($MountPoint) is $($UsePercentage) % used"
                             $DiskSpaceOK = $false
                             }
                         }
@@ -1800,8 +2262,17 @@ foreach($VMHost in $VMHosts){
         }
     }         
 
+}
 
+else{
+    $serversummary += "$($VCServer) - Cannot access vCenter"
+    }
 ### Begin report generation
+
+if (Test-Path "$($OutputFolder)\VMware_Error_Status_Fail.txt"){
+            del "$($OutputFolder)\VMware_Error_Status_Fail.txt"
+            }
+
 if ($ReportMode -or $SendEmail)
 {
     #Get report generation timestamp
@@ -1824,7 +2295,12 @@ if ($ReportMode -or $SendEmail)
     if (!$CheckPowerOffVMs){
         $ignoretext = $ignoretext + "Configured to ignore powered-off VMs."
         }
-        
+    if ($IgnoreHardwareErrors){
+        $ignoretext = $ignoretext + "Configured to ignore hardware errors on : $($IgnoreHardwareErrors)."
+        }  
+    if ($IgnoreVCServices){
+        $ignoretext = $ignoretext + "Configured to ignore VC service status : $($IgnoreVCServices)."
+        } 
     if ($Log) {Write-Logfile "Ignore set is $($ignoretext)"}
     #Create HTML Report
        
@@ -1835,8 +2311,11 @@ if ($ReportMode -or $SendEmail)
         #Set alert flag to true
         $alerts = $true
         # Create the error status file (if not already there)
+        
         Out-File -FilePath "$($OutputFolder)\VMware_Error_Status_Fail.txt"
         #Generate the HTML
+        #$coloredheader = "<h1 style=`"color: $fail;`" align=`"center`">VMware Health</h1>"
+        $coloredheader = "<h1 align=""center""><a href=$ReportURL class=""blink"" style=""color:$fail"" target=""_blank"">$reportsubject</a></h1>"
         $serversummaryhtml = "<h3>VMware Health Details</h3>
                         <p>$ignoretext</p>
                         <p>The following server errors and warnings were detected.</p>
@@ -1853,6 +2332,8 @@ if ($ReportMode -or $SendEmail)
     else
     {
         #Generate the HTML to show no alerts
+        #$coloredheader = "<h1 style=`"color: $pass;`" align=`"center`">VMware Health</h1>"
+        $coloredheader = "<h1 align=""center""><a href=$ReportURL style=""color:$pass"" target=""_blank"">$reportsubject</a></h1>"
         $serversummaryhtml = "<h3>VMware Health Details</h3>
                         <p>$ignoretext</p>
                         <p>No VMware  health errors or warnings.</p>"
@@ -1860,13 +2341,18 @@ if ($ReportMode -or $SendEmail)
     
     #Common HTML head and styles
     $htmlhead="<html>
-                <head><title>VMware GreenScreen - $servicestatus</title></head>
+                <head>
+                <title>VMware GreenScreen - $servicestatus</title>
+                <meta http-Equiv=""Cache-Control"" Content=""no-cache"">
+                <meta http-Equiv=""Pragma"" Content=""no-cache"">
+                <meta http-Equiv=""Expires"" Content=""0"">
+                </head>
                 <style>
                 BODY{font-family: Tahoma; font-size: 8pt;}
                 H1{font-size: 16px;}
                 H2{font-size: 14px;}
                 H3{font-size: 12px;}
-                TABLE{Margin: 0px 0px 0px 4px;Border: 1px solid rgb(190, 190, 190);Font-Family: Tahoma;Font-Size: 8pt;Background-Color: rgb(252, 252, 252);}
+                TABLE{Margin: 0px 0px 0px 4px;width: 100%;Border: 1px solid rgb(190, 190, 190);Font-Family: Tahoma;Font-Size: 8pt;Background-Color: rgb(252, 252, 252);}
                 tr:hover td{Background-Color: rgb(0, 127, 195);Color: rgb(255, 255, 255);}
                 tr:nth-child(even){Background-Color: rgb(110, 122, 130);}
                 th{Text-Align: Left;Color: rgb(150, 150, 220);Padding: 1px 4px 1px 4px;}
@@ -1886,7 +2372,7 @@ if ($ReportMode -or $SendEmail)
                 }
                 </style>
                 <body>
-                <h1 align=""center"">VMware Health Check Report</h1>
+                $coloredheader
                 <h3 align=""center"">Generated: $reportime</h3>"
         
     #VMware Health Report Table Header
@@ -2049,13 +2535,13 @@ if ($ReportMode -or $SendEmail)
             $servicestatus = $servicestatus.ToUpper()
             if ($servicestatus -eq "FAIL"){
                 #Send-MailMessage @smtpsettings -Subject "$servicestatus - $reportemailsubject - $now" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) -Priority High
-                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportemailsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) -Priority High
+                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) -Priority High
                 
                 }
             else
                 {
                 #Send-MailMessage @smtpsettings -Subject "$servicestatus - $reportemailsubject - $now" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) 
-                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportemailsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8)
+                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8)
                 }
         }
     }

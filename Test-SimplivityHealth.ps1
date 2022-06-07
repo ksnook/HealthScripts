@@ -62,9 +62,9 @@ param (
         [Parameter( Mandatory=$false)]
         [string]$ServerList,    
         
-        [Parameter( Mandatory=$false)]
+        #[Parameter( Mandatory=$false)]
         #[string]$ReportFile="c:\source\scripts\simplivity\simplivityhealth.html",
-        [string]$ReportFile="C:\inetpub\wwwroot\monitor\simplivityhealth.html",
+        #[string]$ReportFile="C:\inetpub\wwwroot\monitor\simplivityhealth.html",
 
         [Parameter( Mandatory=$false)]
         [switch]$ReportMode=$true,
@@ -261,6 +261,8 @@ if ($VMList) {
     
 }
 
+
+
 Function Get_ILO_Health ($HostList,$ShowNoVMs)
 {
 
@@ -268,14 +270,14 @@ Function Get_ILO_Health ($HostList,$ShowNoVMs)
 foreach ($OVCHost in $HostList){
     #Let's find the ILO
     $STATUS = $null
-    #write-host $OVCHost
-    #$OVCHostILO = $OVCHost.HostName.Replace("inf","ilo")
     $OVCHostILO = $OVCHost.Replace("inf","ilo")
     $OVCHostILOIP=$(resolve-dnsname -Name $OVCHostILO).IP4Address
+    #write-host $OVCHostILOIP
+    #exit
     $ILOConnect=$null
     if ($OVCHostILOIP){
         try{$ILOConnect=Connect-HPEiLO -IP $OVCHostILOIP -Credential $ILOCredential -DisableCertificateAuthentication}
-        catch{Write-Output "$(OVCHostILOIP) Ran into an issue: $($PSItem.ToString())"}
+        catch{Write-Output "$($OVCHostILOIP) Ran into an issue: $($PSItem.ToString())"}
         }
     if ($ILOConnect){
     ################################ SERVER INFO CHECKS START ################################
@@ -309,11 +311,12 @@ foreach ($OVCHost in $HostList){
         #        #write-host "$($ProcessorInfo.Socket) is empty"
         #        }
         #    }
-        if ($getServerInfo.PowerSupplyInfo.PowerSupplySummary.PowerSystemRedundancy -ne "Redundant"){
-            #write-host "Power supplies are not redundant" -ForegroundColor Red
-            $STATUS="RED"
-            $ERRORTEXT += "`n`r$($OVCHost) Power supplies are not redundant" 
-            }
+        #if ($getServerInfo.PowerSupplyInfo.PowerSupplySummary.PowerSystemRedundancy -ne "Redundant"){
+        #    #write-host "Power supplies are not redundant" -ForegroundColor Red
+        #    $STATUS="RED"
+        #    $ERRORTEXT += "`n`r$($OVCHost) Power supplies are not redundant" 
+        #    if ($Log) {Write-Logfile "$($SimplivityHost.HostName) -  Power supplies are not redundant - $($getServerInfo.PowerSupplyInfo.PowerSupplySummary.PowerSystemRedundancy)"}
+        #    }
         ################################ SERVER INFO CHECKS END ################################
         
         ################################ ILO HEALTH CHECKS START ################################
@@ -574,6 +577,7 @@ if ($Log) {Write-Logfile "Initializing..."}
 # vCenter connection
 $Connection = Connect-VIServer $VCServer -Credential $VCCredential -AllLinked
 
+
 # Grab OVC details
 $OVCIPs=Get-VM -Name OmniStackVC* | select @{N="IPAddress";E={@($_.guest.IPAddress[0])}} | sort IPAddress -unique
 
@@ -597,6 +601,7 @@ while($OVC -eq "Not Connected"){
 #Grab Simplivity Hosts and Datastores
 $SimplivityHosts = Get-SVThost | sort-object -Property HostName
 $SimplivityDatastores = @(Get-SVTdatastore)
+
 #...................................
 
 foreach($SimplivityHost in $SimplivityHosts){ 
@@ -662,7 +667,7 @@ foreach($SimplivityHost in $SimplivityHosts){
         $vmhost = get-VMhost $SimplivityHost.HostName
         #write-host $vmhost.ExtensionData.Summary.Runtime.BootTime
         #[math]::round($a.Length / 1MB, 2)
-        $uptimehours = [math]::round((New-TimeSpan -Start $vmhost.ExtensionData.Summary.Runtime.BootTime -End (Get-Date)).TotalHours,0) #| Select-Object -ExpandProperty Days
+        $uptimehours = [math]::round((New-TimeSpan -Start ($vmhost.ExtensionData.Summary.Runtime.BootTime.touniversaltime()) -End (Get-Date -Format U)).TotalHours,0) #| Select-Object -ExpandProperty Days
         #Write-Host $uptimehours
         #[int]$uptime = "{0:00}" -f $timespan.TotalHours
         if ($uptimehours -lt $MinimumUptime){
@@ -782,16 +787,22 @@ foreach($SimplivityHost in $SimplivityHosts){
         #ILO Health
         Write-Host "Host Hardware: " -NoNewline
         $ERRORS = $null
-        #This function when servers are new and you want to see hosts with no VMs 
-        #$ERRORS += Get_ILO_Health $SimplivityHost.HostName $True
-        #This function when servers are established and you don't want to see hosts with no VMs 
-        $ERRORS += Get_ILO_Health $SimplivityHost.HostName $False
-        $ERRORS
-        Switch (!$ERRORS) {
-            $true { Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Pass" -Force}
-            default { Write-Host -ForegroundColor $fail $ERRORS; $serversummary += "$($SimplivityHost.HostName) - Simplivity Hardware $($ERRORS)";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Fail" -Force}
+        if ($SimplivityHost.HostName -in $IgnoreHardwareErrors){
+            if ($Log) {Write-Logfile "Host in $($IgnoreHardwareErrors) array - Not checking for hardware errors on $($SimplivityHost.HostName)"}
+            $ERRORS = $null
+            Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Pass" -Force
+            } 
+        else{
+            #This function when servers are new and you want to see hosts with no VMs 
+            #$ERRORS += Get_ILO_Health $SimplivityHost.HostName $True
+            #This function when servers are established and you don't want to see hosts with no VMs 
+            $ERRORS += Get_ILO_Health $SimplivityHost.HostName $False
+            $ERRORS
+            Switch (!$ERRORS) {
+                $true { Write-Host -ForegroundColor $pass "Pass";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Pass" -Force}
+                default { Write-Host -ForegroundColor $fail $ERRORS; $serversummary += "$($SimplivityHost.HostName) - Simplivity Hardware $($ERRORS)";$serverObj | Add-Member NoteProperty -Name "Hardware" -Value "Fail" -Force}
+                }
             }
-    
         #Disk Space
         Write-Host "Disk Space: " -NoNewline
         $ERRORS = $null
@@ -821,6 +832,9 @@ if ($ReportMode -or $SendEmail)
     if ($IgnoreHosts){
         $ignoretext = "Configured to ignore hosts: $($IgnoreHosts)."
         }
+    if ($IgnoreHardwareErrors){
+        $ignoretext = $ignoretext + "Configured to ignore hardware errors on : $($IgnoreHardwareErrors)."
+        }
     #Create HTML Report
     
 
@@ -835,6 +849,8 @@ if ($ReportMode -or $SendEmail)
         Out-File -FilePath "$($OutputFolder)\Simplivity_Error_Status_Fail.txt"
         
         #Generate the HTML
+        #$coloredheader = "<h1 style=`"color: $fail;`" align=`"center`">Simplivity Health</h1>"
+        $coloredheader = "<h1 align=""center""><a href=$ReportURL  class=""blink"" style=""color:$fail"" target=""_blank"">$reportsubject</a></h1>"
         $serversummaryhtml = "<h3>Simplivity Health Details</h3>
                         <p>$ignoretext</p>
                         <p>The following server errors and warnings were detected.</p>
@@ -851,6 +867,8 @@ if ($ReportMode -or $SendEmail)
     else
     {
         #Generate the HTML to show no alerts
+        #$coloredheader = "<h1 style=`"color: $pass;`" align=`"center`">Simplivity Health</h1>"
+        $coloredheader = "<h1 align=""center""><a href=$ReportURL style=""color:$pass"" target=""_blank"">$reportsubject</a></h1>"
         $serversummaryhtml = "<h3>Simplivity Health Details</h3>
                         <p>$ignoretext</p>
                         <p>No Simplivity  health errors or warnings.</p>"
@@ -858,13 +876,18 @@ if ($ReportMode -or $SendEmail)
     
     #Common HTML head and styles
     $htmlhead="<html>
-                <head><title>Simplivity GreenScreen - $servicestatus</title></head>
+                <head>
+                <title>Simplivity GreenScreen - $servicestatus</title>
+                <meta http-Equiv=""Cache-Control"" Content=""no-cache"">
+                <meta http-Equiv=""Pragma"" Content=""no-cache"">
+                <meta http-Equiv=""Expires"" Content=""0"">
+                </head>
                 <style>
                 BODY{font-family: Tahoma; font-size: 8pt;}
                 H1{font-size: 16px;}
                 H2{font-size: 14px;}
                 H3{font-size: 12px;}
-                TABLE{Margin: 0px 0px 0px 4px;Border: 1px solid rgb(190, 190, 190);Font-Family: Tahoma;Font-Size: 8pt;Background-Color: rgb(252, 252, 252);}
+                TABLE{Margin: 0px 0px 0px 4px;width: 100%;Border: 1px solid rgb(190, 190, 190);Font-Family: Tahoma;Font-Size: 8pt;Background-Color: rgb(252, 252, 252);}
                 tr:hover td{Background-Color: rgb(0, 127, 195);Color: rgb(255, 255, 255);}
                 tr:nth-child(even){Background-Color: rgb(110, 122, 130);}
                 th{Text-Align: Left;Color: rgb(150, 150, 220);Padding: 1px 4px 1px 4px;}
@@ -884,7 +907,7 @@ if ($ReportMode -or $SendEmail)
                 }
                 </style>
                 <body>
-                <h1 align=""center"">Simplivity Health Check Report</h1>
+                $coloredheader
                 <h3 align=""center"">Generated: $reportime</h3>"
 
         
@@ -1044,13 +1067,13 @@ if ($ReportMode -or $SendEmail)
             $servicestatus = $servicestatus.ToUpper()
             if ($servicestatus -eq "FAIL"){
                 #Send-MailMessage @smtpsettings -Subject "$servicestatus - $reportemailsubject - $now" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) -Priority High
-                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportemailsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) -Priority High
+                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) -Priority High
                 
                 }
             else
                 {
                 #Send-MailMessage @smtpsettings -Subject "$servicestatus - $reportemailsubject - $now" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8) 
-                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportemailsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8)
+                Send-MailMessage @smtpsettings -To $recipients -Subject "$servicestatus - $reportsubject - $reportime" -Body $htmlreport -BodyAsHtml -Encoding ([System.Text.Encoding]::UTF8)
                 }
         }
     }

@@ -927,7 +927,7 @@ $result = @()
 #$VMHost
 #Get-VMHostStorage -RescanAllHba -VMHost $VMStorageHost | Out-Null
 
-#Get-vmhost | Get-VMHostStorage -RescanAllHba | Out-Null
+Get-vmhost | Get-VMHostStorage -RescanAllHba | Out-Null
 
 foreach ($view in $views | Sort-Object -Property Name) {
     if ($Log) {Write-Logfile "Checking $($view.Name)"}
@@ -2003,16 +2003,26 @@ foreach($VMHost in $VMHosts){
             $LicenseRecord = $VCLicenseArray | where {$_."vCenter" -match $vCenter -and $_."LicenseKey" -match $VMHost.LicenseKey}
             $ThisHostsLicenseEntry = $HostAssignedLicenseArray | where {$_.Host -match $VMHost.Name -and $_.vCenter -match $vCenter}
             if ($Log) {Write-Logfile "This hosts licence entry is $($ThisHostsLicenseEntry)"} 
-            if ($Log) {Write-Logfile "This hosts licence expiry is $($ThisHostsLicenseEntry.LicenseExpiryDate)"}
-            if ($ThisHostsLicenseEntry.LicenseExpiryDate -notmatch "Never"){
-                $LicenseExpiring = [math]::round((New-TimeSpan -Start (Get-Date) -End $ThisHostsLicenseEntry.LicenseExpiryDate).TotalDays,0) 
-                write-host "Host licence will expire in $($LicenseExpiring) days" -ForegroundColor Red
-                if ($LicenseExpiring -lt $CertificateTimeToAlert){
-                    $NetworkErrors += "$($VMHost) license will expire in $($LicenseExpiring) days on $($ThisHostsLicenseEntry.LicenseExpiryDate)"
+            if ($LicenseRecord.Name -match "Product Evaluation"){
+                if ($ThisHostsLicenseEntry.LicenseExpiryDate){
+                    $LicenseExpiring = [math]::round((New-TimeSpan -Start (Get-Date) -End $ThisHostsLicenseEntry.LicenseExpiryDate).TotalDays,0)
+                    $NetworkErrors += "$($VMHost) Evaluation license in use - expiry date $($ThisHostsLicenseEntry.LicenseExpiryDate) IN $($LicenseExpiring) DAYS"
+                    }
+                else{
+                    $NetworkErrors += "$($VMHost) Evaluation license in use - expiry date not available"
                     }
                 }
+            else{
+                if ($Log) {Write-Logfile "This hosts licence expiry is $($ThisHostsLicenseEntry.LicenseExpiryDate)"}
+                if ($ThisHostsLicenseEntry.LicenseExpiryDate -notmatch "Never"){
+                    $LicenseExpiring = [math]::round((New-TimeSpan -Start (Get-Date) -End $ThisHostsLicenseEntry.LicenseExpiryDate).TotalDays,0) 
+                    write-host "Host licence will expire in $($LicenseExpiring) days" -ForegroundColor Red
+                    if ($LicenseExpiring -lt $CertificateTimeToAlert){
+                        $NetworkErrors += "$($VMHost) license will expire in $($LicenseExpiring) days on $($ThisHostsLicenseEntry.LicenseExpiryDate)"
+                        }
+                    }
                   
-            
+                }
             
             #write-host "License Name is $($LicenseRecord.Name)" -ForegroundColor Yellow
             if ($Log) {Write-Logfile "License Name is $($LicenseRecord.Name)"}

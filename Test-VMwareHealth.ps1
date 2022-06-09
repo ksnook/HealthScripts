@@ -1348,7 +1348,7 @@ foreach ($VCServer in $VCConnection){
         $response = try { 
                             #write-host "Invoking $($vCenterFQDN)"
                             if ($Log) {Write-Logfile "Invoking $($vCenterFQDN)"}
-                            Invoke-WebRequest $vCenterFQDN
+                            Invoke-WebRequest $vCenterFQDN -UseBasicParsing
                             $RestApiUrl ='https://'+$vCenterFQDN+'/rest'
                             write-host "RestURL is $($RestApiUrl)"
                         } catch { 
